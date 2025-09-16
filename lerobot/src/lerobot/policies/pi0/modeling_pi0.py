@@ -60,7 +60,7 @@ from transformers import AutoTokenizer
 
 from lerobot.constants import ACTION, OBS_STATE
 from lerobot.policies.normalize import Normalize, Unnormalize
-from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi0.configuration_pi0 import PI0Config, PI05Config
 from lerobot.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertConfig,
     PaliGemmaWithExpertModel,
@@ -487,11 +487,24 @@ class PI0Policy(PreTrainedPolicy):
         device = batch[OBS_STATE].device
         tasks = batch["task"]
 
-        # PaliGemma prompt has to end with a new line
-        tasks = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
+        if self.config.pi05:
+            states = batch[OBS_STATE]
+            if self.config.robot_state_feature is not None:
+                original_state_dim = self.config.robot_state_feature.shape[0]
+                states = states[:, :original_state_dim]
+            discretized_states = self._discretize_state(states)
+
+            prompts = []
+            for task, state_tokens in zip(tasks, discretized_states.tolist(), strict=False):
+                cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+                state_str = " ".join(map(str, state_tokens))
+                prompts.append(f"Task: {cleaned_text}, State: {state_str};\nAction: ")
+        else:
+            # PaliGemma prompt has to end with a new line
+            prompts = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
 
         tokenized_prompt = self.language_tokenizer.__call__(
-            tasks,
+            prompts,
             padding="max_length",
             padding_side="right",
             max_length=self.config.tokenizer_max_length,
@@ -501,6 +514,27 @@ class PI0Policy(PreTrainedPolicy):
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
         return lang_tokens, lang_masks
+
+    def _discretize_state(self, state: Tensor) -> Tensor:
+        bins = torch.linspace(-1, 1, steps=256 + 1, device=state.device, dtype=state.dtype)[:-1]
+        indices = torch.bucketize(state, bins)
+        indices = torch.clamp(indices - 1, min=0, max=255)
+        return indices.to(torch.int64)
+
+
+class PI05Policy(PI0Policy):
+    """Policy wrapper for pi0.5 checkpoints."""
+
+    config_class = PI05Config
+    name = "pi05"
+
+    def __init__(
+        self,
+        config: PI05Config,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+    ):
+        config.pi05 = True
+        super().__init__(config, dataset_stats)
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -570,27 +604,33 @@ class PI0FlowMatching(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.pi05 = config.pi05
 
         paligemma_with_export_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
+            use_adaptive_norm=self.pi05,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
 
         # Projections are float32
-        self.state_proj = nn.Linear(self.config.max_state_dim, self.config.proj_width)
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
-
-        self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
-        self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+        if self.pi05:
+            self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
+            self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
+        else:
+            self.state_proj = nn.Linear(self.config.max_state_dim, self.config.proj_width)
+            self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
+            self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
         self.set_requires_grad()
 
     def set_requires_grad(self):
-        for params in self.state_proj.parameters():
-            params.requires_grad = self.config.train_state_proj
+        if hasattr(self, "state_proj"):
+            for params in self.state_proj.parameters():
+                params.requires_grad = self.config.train_state_proj
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -665,20 +705,26 @@ class PI0FlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        adarms_cond = None
 
-        # Embed state
-        state_emb = self.state_proj(state)
-        state_emb = state_emb.to(dtype=torch.bfloat16)
-        embs.append(state_emb[:, None, :])
-        bsize = state_emb.shape[0]
-        dtype = state_emb.dtype
-        device = state_emb.device
+        if not self.pi05:
+            # Embed state
+            state_emb = self.state_proj(state)
+            state_emb = state_emb.to(dtype=torch.bfloat16)
+            embs.append(state_emb[:, None, :])
+            bsize = state_emb.shape[0]
+            dtype = state_emb.dtype
+            device = state_emb.device
 
-        state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
+            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            pad_masks.append(state_mask)
 
-        # Set attention masks so that image and language inputs do not attend to state or actions
-        att_masks += [1]
+            # Set attention masks so that image and language inputs do not attend to state or actions
+            att_masks += [1]
+        else:
+            bsize = noisy_actions.shape[0]
+            dtype = noisy_actions.dtype
+            device = noisy_actions.device
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -689,12 +735,21 @@ class PI0FlowMatching(nn.Module):
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
 
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        if self.pi05:
+            action_emb = action_emb.to(dtype=torch.bfloat16)
+            time_emb = self.time_mlp_in(time_emb)
+            time_emb = F.silu(time_emb)
+            time_emb = self.time_mlp_out(time_emb)
+            time_emb = F.silu(time_emb)
+            action_time_emb = action_emb
+            adarms_cond = time_emb.to(dtype=action_time_emb.dtype)
+        else:
+            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
+            action_time_emb = self.action_time_mlp_in(action_time_emb)
+            action_time_emb = F.silu(action_time_emb)  # swish == silu
+            action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -711,7 +766,7 @@ class PI0FlowMatching(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks
+        return embs, pad_masks, att_masks, adarms_cond
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
@@ -730,13 +785,15 @@ class PI0FlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        adarms_inputs = [None, adarms_cond] if adarms_cond is not None else [None, None]
 
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=att_2d_masks,
@@ -745,6 +802,7 @@ class PI0FlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            adarms_cond=adarms_inputs,
         )
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         # Original openpi code, upcast attention output
@@ -808,7 +866,7 @@ class PI0FlowMatching(nn.Module):
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -822,6 +880,8 @@ class PI0FlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
+        adarms_inputs = [None, adarms_cond] if adarms_cond is not None else [None, None]
+
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
@@ -829,6 +889,7 @@ class PI0FlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            adarms_cond=adarms_inputs,
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
