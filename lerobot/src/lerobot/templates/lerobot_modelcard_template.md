@@ -21,6 +21,8 @@
 [VQ-BET](https://huggingface.co/papers/2403.03181) combines vector-quantised action tokens with Behaviour Transformers to discretise control and achieve data-efficient imitation across diverse skills.
 {% elif model_name == "pi0" %}
 [Pi0](https://huggingface.co/papers/2410.24164) is a generalist vision-language-action transformer that converts multimodal observations and text instructions into robot actions for zero-shot task transfer.
+{% elif model_name == "pi05" %}
+[Pi0.5](https://www.physicalintelligence.company/blog/pi05) extends Pi0 with discrete state tokenisation and adaptive normalization in the action head, improving open-world generalization for robotic manipulation tasks.
 {% elif model_name == "pi0fast" %}
 [Pi0-Fast](https://huggingface.co/papers/2501.09747) is a variant of Pi0 that uses a new tokenization method called FAST, which enables training of an autoregressive vision-language-action policy for high-frequency robotic tasks with improved performance and reduced training time.
 {% elif model_name == "sac" %}

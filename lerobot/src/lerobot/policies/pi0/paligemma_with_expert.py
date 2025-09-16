@@ -17,6 +17,7 @@ import torch
 import torch.version
 from pytest import Cache
 from torch import nn
+from typing import Optional
 from transformers import (
     AutoConfig,
     GemmaForCausalLM,
@@ -55,6 +56,78 @@ def apply_rope(x, positions, max_wavelength=10_000):
     return res.to(dtype)
 
 
+def _gated_residual(residual: torch.Tensor, hidden_states: torch.Tensor, gate: Optional[torch.Tensor]) -> torch.Tensor:
+    if gate is None:
+        return residual + hidden_states
+    gate = torch.sigmoid(gate)
+    # Broadcast gate if necessary
+    while gate.ndim < hidden_states.ndim:
+        gate = gate.unsqueeze(1)
+    return residual + gate * hidden_states
+
+
+class AdaptiveRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, cond_dim: Optional[int] = None):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+        self.cond_dim = cond_dim
+
+        if cond_dim is None:
+            self.weight = nn.Parameter(torch.zeros(dim, dtype=torch.bfloat16))
+            nn.init.zeros_(self.weight)
+            self.dense: nn.Linear | None = None
+        else:
+            self.weight = None
+            self.dense = nn.Linear(cond_dim, dim * 3, bias=True)
+            nn.init.zeros_(self.dense.weight)
+            nn.init.zeros_(self.dense.bias)
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
+        normed = x * torch.rsqrt(var + self.eps)
+        return normed
+
+    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        dtype = x.dtype
+        normed = self._norm(x).to(dtype)
+
+        if self.dense is None or cond is None:
+            if self.weight is None:
+                return normed, None
+            weight = (1.0 + self.weight.float()).to(dtype)
+            return normed * weight, None
+
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
+
+        modulation = self.dense(cond)
+        if modulation.ndim == 2:
+            modulation = modulation.unsqueeze(1)
+        scale, shift, gate = modulation.chunk(3, dim=-1)
+        normed = normed * (1 + scale.float()) + shift.float()
+        return normed.to(dtype), gate.to(dtype)
+
+    @classmethod
+    def from_rms_norm(
+        cls,
+        module: nn.Module,
+        *,
+        cond_dim: Optional[int] = None,
+    ) -> "AdaptiveRMSNorm":
+        eps = getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6))
+        if not hasattr(module, "weight") or module.weight is None:
+            raise ValueError("Cannot convert module without `weight` parameter to AdaptiveRMSNorm")
+        dim = module.weight.shape[0]
+        dtype = module.weight.dtype
+        device = module.weight.device
+
+        adaptive = cls(dim, eps=eps, cond_dim=cond_dim)
+        adaptive = adaptive.to(device=device)
+        if cond_dim is None and hasattr(module, "weight") and module.weight is not None:
+            adaptive.weight.data.copy_(module.weight.data.to(adaptive.weight.dtype))
+        return adaptive.to(dtype=dtype)
+
 class PaliGemmaWithExpertConfig(PretrainedConfig):
     model_type = "PaliGemmaWithExpertModel"
     sub_configs = {"paligemma_config": AutoConfig, "gemma_expert_config": AutoConfig}
@@ -66,11 +139,13 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         freeze_vision_encoder: bool = True,
         train_expert_only: bool = True,
         attention_implementation: str = "eager",
+        use_adaptive_norm: bool = False,
         **kwargs,
     ):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
         self.attention_implementation = attention_implementation
+        self.use_adaptive_norm = use_adaptive_norm
 
         if paligemma_config is None:
             # Default config from Pi0
@@ -178,6 +253,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         # Remove unused embed_tokens
         self.gemma_expert.model.embed_tokens = None
 
+        if self.config.use_adaptive_norm:
+            self._inject_adaptive_norm()
+
         self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
@@ -191,6 +269,19 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+
+    def _inject_adaptive_norm(self) -> None:
+        cond_dim = self.gemma_expert.config.hidden_size
+        for layer in self.gemma_expert.model.layers:
+            layer.input_layernorm = AdaptiveRMSNorm.from_rms_norm(
+                layer.input_layernorm, cond_dim=cond_dim
+            )
+            layer.post_attention_layernorm = AdaptiveRMSNorm.from_rms_norm(
+                layer.post_attention_layernorm, cond_dim=cond_dim
+            )
+        self.gemma_expert.model.norm = AdaptiveRMSNorm.from_rms_norm(
+            self.gemma_expert.model.norm, cond_dim=cond_dim
+        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -233,8 +324,28 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        adarms_cond: list[torch.Tensor | None] | None = None,
     ):
         models = [self.paligemma.language_model, self.gemma_expert.model]
+
+        if adarms_cond is None:
+            adarms_cond = [None, None]
+        else:
+            adarms_cond = list(adarms_cond)
+        if len(adarms_cond) < len(inputs_embeds):
+            adarms_cond += [None] * (len(inputs_embeds) - len(adarms_cond))
+
+        def apply_norm(module, tensor, cond):
+            if cond is not None:
+                try:
+                    result = module(tensor, cond=cond)
+                except TypeError:
+                    result = module(tensor)
+            else:
+                result = module(tensor)
+            if isinstance(result, tuple):
+                return result
+            return result, None
 
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient
@@ -251,13 +362,14 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             query_states = []
             key_states = []
             value_states = []
+            residuals = [None] * len(inputs_embeds)
+            input_gates: list[torch.Tensor | None] = [None] * len(inputs_embeds)
             for i, hidden_states in enumerate(inputs_embeds):
                 if hidden_states is None:
                     continue
                 layer = models[i].layers[layer_idx]
-                # normalizer = torch.tensor(models[i].config.hidden_size**0.5, dtype=hidden_states.dtype)
-                # hidden_states = hidden_states * normalizer
-                hidden_states = layer.input_layernorm(hidden_states)
+                residuals[i] = hidden_states
+                hidden_states, gate = apply_norm(layer.input_layernorm, hidden_states, adarms_cond[i])
 
                 input_shape = hidden_states.shape[:-1]
                 hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -267,6 +379,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
                 value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
+                input_gates[i] = gate
                 query_states.append(query_state)
                 key_states.append(key_state)
                 value_states.append(value_state)
@@ -314,23 +427,18 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 if hidden_states is not None:
                     end = start + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    target_dtype = layer.self_attn.o_proj.weight.dtype
+                    if att_output.dtype != target_dtype:
+                        att_output = att_output.to(target_dtype)
                     out_emb = layer.self_attn.o_proj(att_output[:, start:end])
 
-                    # TODO: first dropout (by default 0.0)
-
-                    # first residual
-                    out_emb += hidden_states
+                    out_emb = _gated_residual(residuals[i], out_emb, input_gates[i])
                     after_first_residual = out_emb.clone()
 
-                    out_emb = layer.post_attention_layernorm(out_emb)
+                    out_emb, post_gate = apply_norm(layer.post_attention_layernorm, out_emb, adarms_cond[i])
                     out_emb = layer.mlp(out_emb)
 
-                    # TODO: second dropout (by default 0.0)
-
-                    # second residual
-                    out_emb += after_first_residual
+                    out_emb = _gated_residual(after_first_residual, out_emb, post_gate)
 
                     outputs_embeds.append(out_emb)
 
@@ -344,7 +452,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         outputs_embeds = []
         for i, hidden_states in enumerate(inputs_embeds):
             if hidden_states is not None:
-                out_emb = models[i].norm(hidden_states)
+                out_emb, _ = apply_norm(models[i].norm, hidden_states, adarms_cond[i])
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)

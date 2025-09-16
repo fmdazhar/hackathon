@@ -60,6 +60,9 @@ class PI0Config(PreTrainedConfig):
     # Tokenizer
     tokenizer_max_length: int = 48
 
+    # Model variants
+    pi05: bool = False
+
     # Projector
     proj_width: int = 1024
 
@@ -92,6 +95,8 @@ class PI0Config(PreTrainedConfig):
 
         # TODO(Steven): Validate device and amp? in all policy configs?
         """Input validation (not exhaustive)."""
+        if self.pi05 and self.tokenizer_max_length < 200:
+            self.tokenizer_max_length = 200
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -139,6 +144,17 @@ class PI0Config(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> None:
         return None
+
+
+@PreTrainedConfig.register_subclass("pi05")
+@dataclass
+class PI05Config(PI0Config):
+    pi05: bool = True
+    tokenizer_max_length: int = 200
+
+    def __post_init__(self):
+        self.pi05 = True
+        super().__post_init__()
 
     @property
     def action_delta_indices(self) -> list:
